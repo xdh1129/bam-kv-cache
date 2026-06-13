@@ -2,7 +2,8 @@ import threading
 import time
 from collections import Counter
 
-from ..ssd.object_store import FileObjectStore, SsdLocation
+from ..ssd.allocator import SsdAllocator
+from ..ssd.object_store import SsdLocation
 from .api import MetadataPlane, MetadataStats
 from .keys import ObjectKey
 from .record import MetadataRecord, State
@@ -14,7 +15,7 @@ class InProcessMetadataStore(MetadataPlane):
     the BaM runtime reads/writes the bytes at those locations separately.
     """
 
-    def __init__(self, object_store: FileObjectStore):
+    def __init__(self, object_store: SsdAllocator):
         self._store = object_store
         self._records: dict[ObjectKey, MetadataRecord] = {}
         self._lock = threading.RLock()
