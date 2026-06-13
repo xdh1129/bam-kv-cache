@@ -28,10 +28,19 @@ This code compiles and runs **only** on the BaM-capable machine. There is **no
 local (Mac) build or test** for the native path — per decision, all verification
 happens on the GPU box.
 
-Requirements (from BaM README): x86 with PCIe P2P, Volta+ Tesla/datacenter GPU,
-a dedicated NVMe SSD bound to BaM's kernel module, IOMMU disabled, CUDA 12.3+,
-BaM built (its CMake produces `libnvm`). The NVMe namespace is **raw block space**
-— there is no filesystem; the device may be overwritten.
+Requirements (from BaM README): x86 with PCIe P2P, Volta+ GPU exposing its memory
+over a large PCIe BAR1 window, a dedicated NVMe SSD bound to BaM's kernel module,
+IOMMU disabled + Above-4G Decoding, CUDA 12.3+, BaM built (its CMake produces
+`libnvm`). The NVMe namespace is **raw block space** — there is no filesystem; the
+device may be overwritten.
+
+**Confirmed target box** (`aiserver-nv-6000ada-x8-122`): 7× RTX 6000 Ada
+(~48 GB, **compute 8.9 → sm_89**), **BAR1 = 65536 MiB (ReBAR on, P2P viable)**.
+NVMe `/dev/nvme0n1` ≈ 1.86 TiB (`2048408248320` bytes), LBA format 0 = **512 B**
+in use (format 1 = 4096 B available; reformatting to 4096 to match `page_size` is
+optional and would wipe the drive). Pre-flight to confirm before running:
+`cat /proc/cmdline | grep -i iommu` (IOMMU off) and that `/dev/nvme0n1` is a
+wipeable spare, not the OS disk.
 
 ## 3. Architecture
 
@@ -147,8 +156,9 @@ type-hint change in `InProcessMetadataStore`, no behavior change.
 ```python
 dev_cfg = BamDeviceConfig(nvme_paths=("/dev/libnvm0",), nvm_namespace=1,
                           cuda_device=0, queue_depth=1024, num_queues=128,
-                          page_size=4096, page_cache_pages=...,
-                          lba_block_size=512, namespace_capacity_bytes=...)
+                          page_size=4096, page_cache_pages=65536,   # 256 MiB cache; size to workload
+                          lba_block_size=512,                        # in use on /dev/nvme0n1
+                          namespace_capacity_bytes=2048408248320)    # ~1.86 TiB
 device   = bam_kv_cache._native.BamDevice(**asdict(dev_cfg))
 runtime  = NativeBamRuntime(device)
 alloc    = RawNamespaceAllocator(dev_cfg.namespace_capacity_bytes, dev_cfg.lba_block_size)
@@ -172,7 +182,7 @@ if os.environ.get("BAM_KV_BUILD_NATIVE") == "1":
         library_dirs=[f"{bam_home}/build/lib"],
         libraries=["nvm"],
         extra_compile_args={"nvcc": ["-O3", "-std=c++17",
-                                     "-gencode=arch=compute_80,code=sm_80"]},
+                                     "-gencode=arch=compute_89,code=sm_89"]},  # RTX 6000 Ada
     )
 ```
 
