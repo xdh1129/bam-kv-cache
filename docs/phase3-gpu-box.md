@@ -64,15 +64,30 @@ Notes:
 
 ## 3. Load the BaM kernel module (root) — the kernel-6.x risk
 
-BaM's README is tested on kernel 5.8 and warns 6.x may not work. This is the
-most likely failure point.
+BaM's README is tested on kernel 5.8 and warns 6.x may not work. In practice,
+on kernel **6.8** the module compiles after **two one-line API ports** (the
+nvidia P2P symbols themselves are still exported by driver 580, so MODPOST is
+clean):
+
+- `module/pci.c` — `class_create()` lost its `owner` arg in 6.4:
+  `class_create(THIS_MODULE, DRIVER_NAME)` → `class_create(DRIVER_NAME)`.
+- `module/map.c` — `get_user_pages()` lost its trailing `vmas` arg in 6.5:
+  `get_user_pages(..., FOLL_WRITE, pages, NULL)` → `get_user_pages(..., FOLL_WRITE, pages)`.
+
+The nvidia driver's `Module.symvers` must exist first (cmake only enables the
+`_CUDA`/P2P module build when it does), so build the driver symbols, then
+re-run cmake so it picks them up:
 
 ```bash
-# Build nvidia driver kernel symbols (for P2P); version = your driver
+# Build nvidia driver kernel symbols (generates Module.symvers; compile-only,
+# does NOT load or replace the running driver). version = your driver.
 cd /usr/src/nvidia-<DRIVER_VERSION>/ && sudo make
+cd $BAM_HOME/build && CC=gcc-12 CXX=g++-12 cmake ..   # now detects Module.symvers
 
-# Build the BaM module
-cd $BAM_HOME/build/module && make
+# Apply the two 6.x ports, then build the module.
+# NOTE: build the module with the kernel's own compiler (gcc-13 here), NOT g++-12,
+# so unset CC/CXX first.
+cd $BAM_HOME/build/module && unset CC CXX && make     # -> libnvm.ko
 
 # Find the spare NVMe's PCI ID (use a WIPEABLE namespace)
 dmesg | grep nvme0
