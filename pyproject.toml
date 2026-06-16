@@ -11,6 +11,7 @@ dependencies = ["torch>=2.0"]
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+native = ["pybind11>=2.10"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
