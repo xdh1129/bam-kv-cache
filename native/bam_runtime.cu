@@ -4,7 +4,6 @@
 #include <mutex>
 #include <unordered_map>
 #include <stdexcept>
-#include <cmath>
 
 // BaM headers (from $BAM_HOME/include) — same set the readwrite benchmark uses.
 #include <nvm_ctrl.h>
@@ -18,45 +17,30 @@
 
 namespace bamkv {
 
-// ---- device-side I/O, modeled on benchmarks/readwrite/main.cu:43-70 ----
-// Issues one NVMe R/W per page-cache entry covering blocks_per_page LBAs.
-__device__ static void rw_one_page(page_cache_d_t* pc, QueuePair* qp,
-                                   uint64_t starting_lba, uint64_t n_blocks,
-                                   unsigned long long pc_entry, bool is_write) {
-    nvm_cmd_t cmd;
-    uint16_t cid = get_cid(&(qp->sq));
-    nvm_cmd_header(&cmd, cid, is_write ? NVM_IO_WRITE : NVM_IO_READ, qp->nvmNamespace);
-    uint64_t prp1 = pc->prp1[pc_entry];
-    uint64_t prp2 = 0;
-    if (pc->prps) prp2 = pc->prp2[pc_entry];
-    nvm_cmd_data_ptr(&cmd, prp1, prp2);
-    nvm_cmd_rw_blks(&cmd, starting_lba, n_blocks);
-    uint16_t sq_pos = sq_enqueue(&qp->sq, &cmd);
-    uint32_t cq_pos = cq_poll(&qp->cq, cid);
-    sq_dequeue(&qp->sq, sq_pos);
-    cq_dequeue(&qp->cq, cq_pos);
-    put_cid(&qp->sq, cid);
-}
-
-// One thread (block) per page of the extent. page_base = first page-cache index
-// holding this extent's bytes; lba_base = first LBA of the extent.
-__global__ static void rw_extent_kernel(Controller** ctrls, page_cache_d_t* pc,
+// One thread per page of the extent. page_base = first page-cache index holding
+// this extent's bytes; lba_base = first LBA of the extent. Uses the page cache's
+// own device-side controller array (pc->d_ctrls, built correctly by page_cache_t)
+// and the library's read_data/write_data primitives (page_cache.h:553-554) rather
+// than re-implementing NVMe queue handling.
+__global__ static void rw_extent_kernel(page_cache_d_t* pc,
                                         uint64_t lba_base, uint64_t page_base,
                                         uint64_t n_pages, uint64_t blocks_per_page,
-                                        uint32_t num_ctrls, bool is_write) {
+                                        bool is_write) {
     uint64_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_pages) return;
-    uint32_t ctrl = (i / 32) % num_ctrls;
-    uint32_t queue = (i / 32) % (ctrls[ctrl]->n_qps);
+    uint32_t ctrl = (uint32_t)((i / 32) % pc->n_ctrls);
+    Controller* c = pc->d_ctrls[ctrl];
+    uint32_t queue = (uint32_t)((i / 32) % c->n_qps);
     uint64_t starting_lba = lba_base + i * blocks_per_page;
-    rw_one_page(pc, (ctrls[ctrl]->d_qps) + queue, starting_lba, blocks_per_page,
-                page_base + i, is_write);
+    if (is_write)
+        write_data(pc, (c->d_qps) + queue, starting_lba, blocks_per_page, page_base + i);
+    else
+        read_data(pc, (c->d_qps) + queue, starting_lba, blocks_per_page, page_base + i);
 }
 
 struct BamDevice::Impl {
     BamDeviceParams params;
     std::vector<Controller*> ctrls;
-    Controller** d_ctrls = nullptr;   // device array of controller pointers
     page_cache_t* h_pc = nullptr;     // host-side page cache object (owns GPU buffer)
     page_cache_d_t* d_pc = nullptr;   // device page cache pointer (h_pc->d_pc_ptr)
     void* base_addr = nullptr;        // GPU page-cache data buffer (h_pc->pdt.base_addr)
@@ -84,12 +68,8 @@ BamDevice::BamDevice(const BamDeviceParams& params) {
         impl_->ctrls.push_back(new Controller(params.nvme_paths[i].c_str(), params.nvm_namespace,
                                               params.cuda_device, params.queue_depth, params.num_queues));
     }
-    // Device array of controller pointers (benchmark passes Controller** to kernels).
-    ck(cudaMalloc(&impl_->d_ctrls, impl_->ctrls.size() * sizeof(Controller*)), "cudaMalloc d_ctrls");
-    ck(cudaMemcpy(impl_->d_ctrls, impl_->ctrls.data(), impl_->ctrls.size() * sizeof(Controller*),
-                  cudaMemcpyHostToDevice), "cudaMemcpy d_ctrls");
-
-    // Page cache — mirrors benchmarks/readwrite/main.cu:269.
+    // Page cache — mirrors benchmarks/readwrite/main.cu:269. Its constructor builds
+    // the device-side controller array (pdt.d_ctrls), reachable as pc->d_ctrls in kernels.
     impl_->h_pc = new page_cache_t(params.page_size, params.page_cache_pages, params.cuda_device,
                                    impl_->ctrls[0][0], (uint64_t)64, impl_->ctrls);
     impl_->d_pc = (page_cache_d_t*)(impl_->h_pc->d_pc_ptr);
@@ -99,14 +79,21 @@ BamDevice::BamDevice(const BamDeviceParams& params) {
 
 BamDevice::~BamDevice() {
     if (!impl_) return;
-    for (auto& kv : impl_->events) cudaEventDestroy(kv.second);
+    for (auto& kv : impl_->events) {
+        if (kv.second) cudaEventDestroy(kv.second);
+    }
     if (impl_->h_pc) delete impl_->h_pc;
-    if (impl_->d_ctrls) cudaFree(impl_->d_ctrls);
     for (auto* c : impl_->ctrls) delete c;
     delete impl_;
 }
 
 // Reserve a contiguous page-region of n_pages in the ring; returns first page index.
+// INVARIANT: the ring does not track in-flight occupancy, so the page cache must be
+// sized so that all *concurrently in-flight* extents (submitted but not yet waited)
+// fit without wrapping onto each other. The v1 connector submits then waits per layer
+// (one in-flight extent at a time), which satisfies this. Pipelining more extents than
+// fit in page_cache_pages would let a wrapped reservation clobber a buffer still being
+// DMA'd — size page_cache_pages accordingly, or add occupancy tracking before doing so.
 static int64_t reserve_pages(BamDevice::Impl* d, int64_t n_pages) {
     if (n_pages > d->total_pages())
         throw std::runtime_error("extent larger than page cache");
@@ -121,6 +108,7 @@ uint64_t BamDevice::submit_store(uintptr_t dptr, int64_t nbytes, int64_t dev_off
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
     std::lock_guard<std::mutex> lk(d->mu);
     try {
+        ck(cudaSetDevice(d->params.cuda_device), "cudaSetDevice");
         int64_t n_pages = (nbytes + d->params.page_size - 1) / d->params.page_size;
         int64_t page_base = reserve_pages(d, n_pages);
         uint64_t lba_base = (uint64_t)(dev_offset / d->params.lba_block_size);
@@ -128,9 +116,9 @@ uint64_t BamDevice::submit_store(uintptr_t dptr, int64_t nbytes, int64_t dev_off
         // KV tensor (GPU) -> page-cache buffer (GPU), then flush pages to SSD.
         ck(cudaMemcpyAsync(pc_region, (void*)dptr, nbytes, cudaMemcpyDeviceToDevice, s), "memcpy store D2D");
         int threads = 256, blocks = (int)((n_pages + threads - 1) / threads);
-        rw_extent_kernel<<<blocks, threads, 0, s>>>(d->d_ctrls, d->d_pc, lba_base, page_base,
-                                                    n_pages, d->blocks_per_page,
-                                                    (uint32_t)d->ctrls.size(), /*is_write=*/true);
+        rw_extent_kernel<<<blocks, threads, 0, s>>>(d->d_pc, lba_base, page_base,
+                                                    n_pages, d->blocks_per_page, /*is_write=*/true);
+        ck(cudaPeekAtLastError(), "rw_extent_kernel store launch");
         cudaEvent_t ev; ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "eventCreate");
         ck(cudaEventRecord(ev, s), "eventRecord");
         uint64_t h = d->next_handle++;
@@ -148,15 +136,16 @@ uint64_t BamDevice::submit_load(uintptr_t dptr, int64_t nbytes, int64_t dev_offs
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
     std::lock_guard<std::mutex> lk(d->mu);
     try {
+        ck(cudaSetDevice(d->params.cuda_device), "cudaSetDevice");
         int64_t n_pages = (nbytes + d->params.page_size - 1) / d->params.page_size;
         int64_t page_base = reserve_pages(d, n_pages);
         uint64_t lba_base = (uint64_t)(dev_offset / d->params.lba_block_size);
         char* pc_region = (char*)d->base_addr + page_base * d->params.page_size;
         int threads = 256, blocks = (int)((n_pages + threads - 1) / threads);
         // SSD -> page-cache buffer (GPU), then page-cache -> KV tensor (GPU).
-        rw_extent_kernel<<<blocks, threads, 0, s>>>(d->d_ctrls, d->d_pc, lba_base, page_base,
-                                                    n_pages, d->blocks_per_page,
-                                                    (uint32_t)d->ctrls.size(), /*is_write=*/false);
+        rw_extent_kernel<<<blocks, threads, 0, s>>>(d->d_pc, lba_base, page_base,
+                                                    n_pages, d->blocks_per_page, /*is_write=*/false);
+        ck(cudaPeekAtLastError(), "rw_extent_kernel load launch");
         ck(cudaMemcpyAsync((void*)dptr, pc_region, nbytes, cudaMemcpyDeviceToDevice, s), "memcpy load D2D");
         cudaEvent_t ev; ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "eventCreate");
         ck(cudaEventRecord(ev, s), "eventRecord");
@@ -170,9 +159,12 @@ uint64_t BamDevice::submit_load(uintptr_t dptr, int64_t nbytes, int64_t dev_offs
     }
 }
 
+// poll is non-destructive: it never erases the handle, so it stays queryable until
+// the caller's terminal wait() reclaims the event. (The v1 connector only calls wait.)
 int BamDevice::poll(uint64_t handle) {
     auto* d = impl_;
     std::lock_guard<std::mutex> lk(d->mu);
+    cudaSetDevice(d->params.cuda_device);
     auto it = d->events.find(handle);
     if (it == d->events.end() || it->second == nullptr) return FAILED;
     cudaError_t q = cudaEventQuery(it->second);
@@ -181,16 +173,27 @@ int BamDevice::poll(uint64_t handle) {
     return FAILED;
 }
 
+// wait is terminal and called exactly once per handle: it destroys and erases the
+// event afterward so the table does not grow without bound over a long run.
 int BamDevice::wait(uint64_t handle) {
     auto* d = impl_;
     cudaEvent_t ev;
     {
         std::lock_guard<std::mutex> lk(d->mu);
+        cudaSetDevice(d->params.cuda_device);
         auto it = d->events.find(handle);
         if (it == d->events.end() || it->second == nullptr) return FAILED;
         ev = it->second;
     }
     cudaError_t e = cudaEventSynchronize(ev);
+    {
+        std::lock_guard<std::mutex> lk(d->mu);
+        auto it = d->events.find(handle);
+        if (it != d->events.end()) {
+            cudaEventDestroy(it->second);
+            d->events.erase(it);
+        }
+    }
     return e == cudaSuccess ? DONE : FAILED;
 }
 

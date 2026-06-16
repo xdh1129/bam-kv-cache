@@ -64,12 +64,12 @@ class NativeBamRuntime(BamRuntime):
         return IoHandle(handle_id=hid)
 
     def poll(self, handle: IoHandle) -> IoStatus:
-        st = _STATUS[self._dev.poll(handle.handle_id)]
+        st = _STATUS.get(self._dev.poll(handle.handle_id), IoStatus.FAILED)
         handle.status = st
         return st
 
     def wait(self, handle: IoHandle) -> IoStatus:
-        st = _STATUS[self._dev.wait(handle.handle_id)]
+        st = _STATUS.get(self._dev.wait(handle.handle_id), IoStatus.FAILED)
         handle.status = st
         if st is IoStatus.FAILED:
             handle.error = "bam device reported failure"
