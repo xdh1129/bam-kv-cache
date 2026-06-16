@@ -27,7 +27,14 @@ if os.environ.get("BAM_KV_BUILD_NATIVE") == "1":
         CUDAExtension(
             name="bam_kv_cache._native",
             sources=["native/bindings.cpp", "native/bam_runtime.cu"],
-            include_dirs=[os.path.join(bam_home, "include")],
+            # Mirror BaM's own include_directories (CMakeLists.txt): the source
+            # include/, the bundled freestanding headers (provides <simt/atomic>,
+            # pulled by nvm_types.h), and build/include for generated headers.
+            include_dirs=[
+                os.path.join(bam_home, "include"),
+                os.path.join(bam_home, "include", "freestanding", "include"),
+                os.path.join(bam_home, "build", "include"),
+            ],
             library_dirs=[os.path.join(bam_home, "build", "lib")],
             libraries=["nvm"],
             runtime_library_dirs=[os.path.join(bam_home, "build", "lib")],
