@@ -94,7 +94,7 @@ BamDevice::~BamDevice() {
 // (one in-flight extent at a time), which satisfies this. Pipelining more extents than
 // fit in page_cache_pages would let a wrapped reservation clobber a buffer still being
 // DMA'd — size page_cache_pages accordingly, or add occupancy tracking before doing so.
-static int64_t reserve_pages(BamDevice::Impl* d, int64_t n_pages) {
+int64_t BamDevice::reserve_pages(Impl* d, int64_t n_pages) {
     if (n_pages > d->total_pages())
         throw std::runtime_error("extent larger than page cache");
     if (d->ring_next + n_pages > d->total_pages()) d->ring_next = 0;  // wrap

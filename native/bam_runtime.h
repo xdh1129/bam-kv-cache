@@ -40,6 +40,8 @@ public:
 private:
     struct Impl;
     Impl* impl_;
+    // Page-region ring reservation; member so it can name the private Impl.
+    static int64_t reserve_pages(Impl* d, int64_t n_pages);
 };
 
 }  // namespace bamkv
