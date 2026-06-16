@@ -1,5 +1,9 @@
 from typing import Any
 
+# Importing torch first loads libc10/libtorch into the process so the native
+# extension (which links against them) can resolve its symbols on dlopen.
+import torch  # noqa: F401
+
 from .base import BamRuntime
 from .descriptors import IoHandle, IoStatus, KVTensorDescriptor, SlotMapping
 
