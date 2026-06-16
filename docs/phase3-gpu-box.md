@@ -1,30 +1,97 @@
-# Phase 3: building and running BaM runtime on the GPU box
+# Phase 3: building and running the BaM runtime on the GPU box
 
-## Prereqs
+This is the proven recipe from bringing the native extension up on
+`aiserver-nv-6000ada-x8-122` (Ubuntu 24.04, kernel 6.8, CUDA 13, RTX 6000 Ada
+sm_89). Adjust paths/versions for your box.
 
-One-time machine setup:
+## 0. Toolchain reality check
 
-- IOMMU disabled.
-- Above-4G Decoding and Resizable BAR enabled.
-- `nvidia-smi -q -d MEMORY | grep -iA3 BAR1` shows GB-scale BAR1 memory.
-- BaM is built, with `$BAM_HOME/build/lib/libnvm.so` and `$BAM_HOME/include`.
-- BaM kernel module is loaded and `/dev/libnvm0` exists.
-- `/dev/nvme0n1` is a wipeable spare namespace bound to BaM.
-
-## Build the native extension
+BaM's bundled `freestanding` headers reject newer g++ frontends, so the whole
+stack must be built with an **older host compiler**. On this box the system g++
+is 13 (fails); **g++-12 works**:
 
 ```bash
-export BAM_HOME=/path/to/bam
-export BAM_KV_BUILD_NATIVE=1
-export BAM_KV_CUDA_ARCH=89
-pip install -e ".[test,native]"
-python -c "import bam_kv_cache._native; print('native OK')"
+sudo apt install -y gcc-12 g++-12 cmake ninja-build
+ls -d /usr/local/cuda*            # CUDA toolkit (13.x here); add bin/ to PATH
+export PATH=/usr/local/cuda/bin:$PATH
+export CUDA_HOME=/usr/local/cuda
+nvcc --version
 ```
 
-`BAM_KV_CUDA_ARCH=89` targets RTX 6000 Ada. Change it if the GPU box uses a
-different compute capability.
+## 1. Build BaM's `libnvm.so` (no root)
 
-## Run the hardware round-trip
+```bash
+cd $BAM_HOME                      # the BaM repo
+git submodule update --init --recursive    # pulls include/freestanding (provides <simt/atomic>)
+mkdir -p build && cd build
+rm -f CMakeCache.txt              # if re-running with a different compiler
+CC=gcc-12 CXX=g++-12 cmake ..
+make libnvm -j
+ls lib/libnvm.so                  # expected artifact
+```
+
+## 2. Build the native extension (no root)
+
+Requires a CUDA-enabled torch whose CUDA major matches `nvcc`
+(here torch 2.12+cu130 vs nvcc 13 — major 13 matches). Use a venv; Ubuntu 24.04
+blocks system `pip install`.
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install --upgrade "setuptools<82" wheel pybind11 ninja numpy torch
+
+export BAM_HOME=/home/poc/bam-connector/bam
+export BAM_KV_BUILD_NATIVE=1
+export BAM_KV_CUDA_ARCH=89
+export BAM_KV_HOST_CXX=g++-12     # nvcc host compiler; must match step 1
+export CC=gcc-12 CXX=g++-12
+export PATH=/usr/local/cuda/bin:$PATH
+export CUDA_HOME=/usr/local/cuda
+
+# --no-build-isolation so setup.py can see the venv's torch
+pip install -e ".[test,native]" --no-build-isolation
+
+python -c "import torch, bam_kv_cache._native; print('native OK')"
+```
+
+Notes:
+- `import torch` must come before `import bam_kv_cache._native` (the ext links
+  libtorch/libc10). `runtime/native_bam.py` imports torch at module top for this.
+- `BAM_KV_HOST_CXX` adds `-ccbin g++-12` to nvcc; without it nvcc falls back to
+  the system g++ and re-hits the freestanding error.
+- `setup.py` mirrors BaM's three include dirs: `include`,
+  `include/freestanding/include`, `build/include`.
+
+## 3. Load the BaM kernel module (root) — the kernel-6.x risk
+
+BaM's README is tested on kernel 5.8 and warns 6.x may not work. This is the
+most likely failure point.
+
+```bash
+# Build nvidia driver kernel symbols (for P2P); version = your driver
+cd /usr/src/nvidia-<DRIVER_VERSION>/ && sudo make
+
+# Build the BaM module
+cd $BAM_HOME/build/module && make
+
+# Find the spare NVMe's PCI ID (use a WIPEABLE namespace)
+dmesg | grep nvme0
+
+# Unbind it from the kernel nvme driver (root)
+echo -n "<PCI_ID>" | sudo tee /sys/bus/pci/devices/<PCI_ID>/driver/unbind
+
+# Load BaM module -> creates /dev/libnvm*
+cd $BAM_HOME/build/module && sudo make load
+ls -l /dev/libnvm*
+```
+
+Also confirm IOMMU is off: `cat /proc/cmdline | grep -i iommu` should find
+nothing (else disable via grub + reboot).
+
+## 4. Run the hardware round-trip
+
+> WARNING: this writes raw LBAs to the bound NVMe namespace from offset 0.
+> Use a spare, wipeable namespace.
 
 ```bash
 export BAM_KV_RUN_HW=1
@@ -32,12 +99,12 @@ export BAM_KV_NVME=/dev/libnvm0
 python -m pytest tests/test_native_roundtrip.py -v
 ```
 
-## Local/off-box behavior
+## Local / off-box behavior
 
 The pure-Python suite runs with or without the native build:
 
 ```bash
-python -m pytest -q
+python -m pytest -q          # 47 passed, 2 skipped
 ```
 
 `tests/test_native_roundtrip.py` is skipped unless `bam_kv_cache._native` is
